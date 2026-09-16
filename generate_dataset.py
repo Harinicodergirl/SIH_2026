@@ -170,12 +170,15 @@ def find_speech_dataset(speech_root):
     """
     Find:
 
-        speaker(1)
-        speaker(2)
+        speaker (1)
+        speaker (2)
         ...
-        speaker(41)
+        speaker (41)
 
     Each speaker should contain 15 recordings.
+
+    NOTE: folder names use a SPACE before the parenthesis,
+    e.g. "speaker (1)", matching the actual dataset layout.
     """
 
     speech_root = Path(speech_root)
@@ -187,7 +190,7 @@ def find_speech_dataset(speech_root):
         EXPECTED_SPEAKERS + 1
     ):
 
-        speaker_name = f"speaker({i})"
+        speaker_name = f"speaker ({i})"
 
         speaker_dir = (
             speech_root / speaker_name
@@ -229,27 +232,27 @@ def find_speech_dataset(speech_root):
 # NOISE DATASET DISCOVERY
 # ============================================================
 
-def find_noise_dataset(
-    dataset_root,
-    speech_root
-):
+def find_noise_dataset(dataset_root):
     """
-    Find all noise files under dataset/.
+    Find all noise categories under dataset/noise/.
 
-    The speech directory is excluded.
-
-    Example noise structure:
+    Actual structure:
 
         dataset/
-        ├── engine/
-        ├── gunshot/
-        ├── helicopter/
-        ├── rain/
-        ├── siren/
-        ├── vehicle/
-        ├── artillery/
-        ├── drone/
-        └── ...
+        ├── noise/
+        │   ├── engine/
+        │   ├── gunshot/
+        │   ├── helicopter/
+        │   ├── rain/
+        │   └── siren/
+        └── raw/
+            └── signals/
+                └── speech/
+                    └── speaker (1..41)/
+
+    Each subfolder of dataset/noise/ becomes one noise
+    category. dataset/raw/ is never touched, so clean
+    speech can never be picked up as noise.
 
     Returns:
 
@@ -260,23 +263,22 @@ def find_noise_dataset(
         }
     """
 
-    dataset_root = Path(
-        dataset_root
-    ).resolve()
+    dataset_root = Path(dataset_root).resolve()
 
-    speech_root = Path(
-        speech_root
-    ).resolve()
+    noise_root = dataset_root / "noise"
+
+    if not noise_root.exists():
+
+        raise RuntimeError(
+            f"Missing noise folder:\n"
+            f"{noise_root}"
+        )
 
     noise_dataset = {}
 
-    for folder in dataset_root.iterdir():
+    for folder in sorted(noise_root.iterdir()):
 
         if not folder.is_dir():
-            continue
-
-        # Never treat speech as noise
-        if folder.resolve() == speech_root.resolve():
             continue
 
         files = [
@@ -312,11 +314,11 @@ def select_speech(
 
     Example:
 
-        sample 0  -> speaker(1)
-        sample 1  -> speaker(2)
+        sample 0  -> speaker (1)
+        sample 1  -> speaker (2)
         ...
-        sample 40 -> speaker(41)
-        sample 41 -> speaker(1)
+        sample 40 -> speaker (41)
+        sample 41 -> speaker (1)
 
     This ensures that the 50,000 samples are
     approximately balanced across all 41 speakers.
@@ -327,7 +329,7 @@ def select_speech(
     )
 
     speaker_name = (
-        f"speaker({speaker_index + 1})"
+        f"speaker ({speaker_index + 1})"
     )
 
     recordings = speakers[
@@ -741,9 +743,13 @@ def generate_samples(
         # Filename
         # --------------------------------------------
 
+        safe_speaker_tag = speaker_name.replace(
+            " ", ""
+        )
+
         filename = (
             f"sample_{global_id:06d}"
-            f"_speaker_{speaker_name}"
+            f"_speaker_{safe_speaker_tag}"
             f"_snr_{snr_db:+03d}dB"
             f"_{noise_type}.wav"
         )
@@ -967,8 +973,7 @@ if __name__ == "__main__":
     )
 
     noise_dataset = find_noise_dataset(
-        DATASET_ROOT,
-        SPEECH_ROOT
+        DATASET_ROOT
     )
 
     print()
