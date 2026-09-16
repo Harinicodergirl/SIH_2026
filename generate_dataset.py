@@ -15,55 +15,80 @@ from scipy.signal import resample_poly
 
 TARGET_SR = 16000
 
+# Required SNR levels
 SNR_LEVELS = [15, 5, 0, -5, -15]
 
-# Approximately 50% single-noise and 50% multiple-noise
+# Probability of using multiple noises
 MULTI_NOISE_PROBABILITY = 0.5
 
-# Number of noises when using multiple-noise mode
+# Number of noises in multiple-noise mixture
 MIN_NOISES = 2
 MAX_NOISES = 4
 
-# Supported audio files
+# Expected clean speech dataset
+EXPECTED_SPEAKERS = 41
+EXPECTED_RECORDINGS_PER_SPEAKER = 15
+
+# Supported formats
 AUDIO_EXTENSIONS = {".wav", ".flac"}
+
+# Total target dataset
+TOTAL_SAMPLES = 50000
+
+# Reproducibility
+GLOBAL_SEED = 2026
 
 
 # ============================================================
-# AUDIO UTILITIES
+# AUDIO FUNCTIONS
 # ============================================================
 
 def load_audio(filepath, target_sr=TARGET_SR):
     """
-    Load audio as mono float32 and resample to target_sr.
+    Load an audio file.
+
+    Converts:
+        stereo -> mono
+        original sampling rate -> 16 kHz
     """
 
     audio, sr = sf.read(filepath, dtype="float32")
 
-    # Convert stereo -> mono
+    # Stereo -> mono
     if audio.ndim > 1:
         audio = np.mean(audio, axis=1)
 
     # Remove NaN / Inf
     audio = np.nan_to_num(audio)
 
-    # Resample if required
+    # Resample
     if sr != target_sr:
+
         gcd = np.gcd(sr, target_sr)
 
         up = target_sr // gcd
         down = sr // gcd
 
-        audio = resample_poly(audio, up, down)
+        audio = resample_poly(
+            audio,
+            up,
+            down
+        )
+
+    # Remove DC offset
+    audio = audio - np.mean(audio)
 
     return audio.astype(np.float32)
 
 
 def rms(signal):
     """
-    Calculate RMS energy.
+    Calculate RMS amplitude.
     """
 
-    return np.sqrt(np.mean(signal ** 2) + 1e-12)
+    return np.sqrt(
+        np.mean(signal ** 2) + 1e-12
+    )
 
 
 def normalize_rms(signal):
@@ -71,23 +96,23 @@ def normalize_rms(signal):
     Normalize signal to RMS = 1.
     """
 
-    r = rms(signal)
+    value = rms(signal)
 
-    if r < 1e-10:
+    if value < 1e-10:
         return signal
 
-    return signal / r
+    return signal / value
 
 
 def match_length(signal, target_length, rng):
     """
-    Make signal exactly target_length.
+    Make noise exactly the same length as speech.
 
-    If shorter:
-        Repeat it.
+    If noise is shorter:
+        repeat it.
 
-    If longer:
-        Randomly crop it.
+    If noise is longer:
+        randomly crop it.
     """
 
     if len(signal) == target_length:
@@ -95,373 +120,608 @@ def match_length(signal, target_length, rng):
 
     if len(signal) < target_length:
 
-        # Repeat until long enough
-        repeats = int(np.ceil(target_length / len(signal)))
+        repeats = int(
+            np.ceil(
+                target_length / len(signal)
+            )
+        )
 
-        signal = np.tile(signal, repeats)
+        signal = np.tile(
+            signal,
+            repeats
+        )
 
-        # Random starting point
         max_start = len(signal) - target_length
 
         if max_start > 0:
-            start = rng.randint(0, max_start)
-            signal = signal[start:start + target_length]
+            start = rng.randint(
+                0,
+                max_start
+            )
+
+            signal = signal[
+                start:start + target_length
+            ]
+
         else:
             signal = signal[:target_length]
 
     else:
 
-        # Random crop
         max_start = len(signal) - target_length
 
-        start = rng.randint(0, max_start)
+        start = rng.randint(
+            0,
+            max_start
+        )
 
-        signal = signal[start:start + target_length]
+        signal = signal[
+            start:start + target_length
+        ]
 
     return signal.astype(np.float32)
 
 
-def choose_speech_segment(speech_file, rng):
+# ============================================================
+# SPEAKER DATASET DISCOVERY
+# ============================================================
+
+def find_speech_dataset(speech_root):
     """
-    Load speech and return the complete speech signal.
+    Find:
 
-    Later, this can be changed to fixed-duration chunks.
+        speaker(1)
+        speaker(2)
+        ...
+        speaker(41)
+
+    Each speaker should contain 15 recordings.
     """
 
-    speech = load_audio(speech_file)
+    speech_root = Path(speech_root)
 
-    # Remove very short files
-    if len(speech) < TARGET_SR:
-        return None
+    speakers = {}
 
-    # Remove DC offset
-    speech = speech - np.mean(speech)
+    for i in range(
+        1,
+        EXPECTED_SPEAKERS + 1
+    ):
 
-    return speech
+        speaker_name = f"speaker({i})"
+
+        speaker_dir = (
+            speech_root / speaker_name
+        )
+
+        if not speaker_dir.exists():
+
+            raise RuntimeError(
+                f"Missing speaker folder:\n"
+                f"{speaker_dir}"
+            )
+
+        recordings = sorted([
+            p
+            for p in speaker_dir.iterdir()
+            if (
+                p.is_file()
+                and
+                p.suffix.lower()
+                in AUDIO_EXTENSIONS
+            )
+        ])
+
+        if len(recordings) != EXPECTED_RECORDINGS_PER_SPEAKER:
+
+            raise RuntimeError(
+                f"{speaker_name} contains "
+                f"{len(recordings)} recordings.\n"
+                f"Expected "
+                f"{EXPECTED_RECORDINGS_PER_SPEAKER}."
+            )
+
+        speakers[speaker_name] = recordings
+
+    return speakers
 
 
 # ============================================================
-# NOISE MIXING
+# NOISE DATASET DISCOVERY
 # ============================================================
 
-def create_noise(noise_files, target_length, rng):
+def find_noise_dataset(
+    dataset_root,
+    speech_root
+):
     """
-    Create a noise signal of target_length.
+    Find all noise files under dataset/.
 
-    noise_files:
-        list containing either one noise file
-        or multiple noise files.
+    The speech directory is excluded.
+
+    Example noise structure:
+
+        dataset/
+        ├── engine/
+        ├── gunshot/
+        ├── helicopter/
+        ├── rain/
+        ├── siren/
+        ├── vehicle/
+        ├── artillery/
+        ├── drone/
+        └── ...
+
+    Returns:
+
+        {
+            "engine": [...],
+            "gunshot": [...],
+            ...
+        }
     """
 
-    noise_components = []
+    dataset_root = Path(
+        dataset_root
+    ).resolve()
 
-    for noise_file in noise_files:
+    speech_root = Path(
+        speech_root
+    ).resolve()
 
-        noise = load_audio(noise_file)
+    noise_dataset = {}
+
+    for folder in dataset_root.iterdir():
+
+        if not folder.is_dir():
+            continue
+
+        # Never treat speech as noise
+        if folder.resolve() == speech_root.resolve():
+            continue
+
+        files = [
+            p
+            for p in folder.rglob("*")
+            if (
+                p.is_file()
+                and
+                p.suffix.lower()
+                in AUDIO_EXTENSIONS
+            )
+        ]
+
+        if files:
+
+            noise_dataset[
+                folder.name
+            ] = sorted(files)
+
+    return noise_dataset
+
+
+# ============================================================
+# SELECT SPEAKER + RECORDING
+# ============================================================
+
+def select_speech(
+    speakers,
+    global_id
+):
+    """
+    Select speakers in a balanced deterministic way.
+
+    Example:
+
+        sample 0  -> speaker(1)
+        sample 1  -> speaker(2)
+        ...
+        sample 40 -> speaker(41)
+        sample 41 -> speaker(1)
+
+    This ensures that the 50,000 samples are
+    approximately balanced across all 41 speakers.
+    """
+
+    speaker_index = (
+        global_id % EXPECTED_SPEAKERS
+    )
+
+    speaker_name = (
+        f"speaker({speaker_index + 1})"
+    )
+
+    recordings = speakers[
+        speaker_name
+    ]
+
+    # Deterministic recording selection
+    rng = random.Random(
+        GLOBAL_SEED + global_id
+    )
+
+    recording = rng.choice(
+        recordings
+    )
+
+    return (
+        speaker_name,
+        recording
+    )
+
+
+# ============================================================
+# CREATE NOISE
+# ============================================================
+
+def create_noise(
+    selected_noise_files,
+    target_length,
+    rng
+):
+    """
+    Load and combine one or multiple noises.
+    """
+
+    components = []
+
+    for noise_file in selected_noise_files:
+
+        noise = load_audio(
+            noise_file
+        )
 
         if len(noise) == 0:
             continue
 
-        noise = noise - np.mean(noise)
-
-        # Make same length as speech
         noise = match_length(
             noise,
             target_length,
             rng
         )
 
-        # Normalize each noise before combining
-        noise = normalize_rms(noise)
+        noise = normalize_rms(
+            noise
+        )
 
-        noise_components.append(noise)
+        components.append(noise)
 
-    if len(noise_components) == 0:
+    if not components:
         return None
 
-    # Combine multiple noises
-    noise = np.zeros(target_length, dtype=np.float32)
+    # Combine noises
+    combined_noise = np.zeros(
+        target_length,
+        dtype=np.float32
+    )
 
-    for component in noise_components:
-        noise += component
+    for noise in components:
 
-    # Normalize the FINAL combined noise.
-    #
-    # This is important because we want the TOTAL noise
-    # to have the requested SNR.
-    noise = normalize_rms(noise)
+        combined_noise += noise
 
-    return noise
+    # Normalize TOTAL noise
+    combined_noise = normalize_rms(
+        combined_noise
+    )
+
+    return combined_noise
 
 
-def mix_at_snr(speech, noise, snr_db):
+# ============================================================
+# MIX AT SPECIFIC SNR
+# ============================================================
+
+def mix_at_snr(
+    speech,
+    noise,
+    snr_db
+):
     """
-    Mix speech and noise at a specified SNR.
+    Mix noise with speech at requested SNR.
 
-    SNR = 10 log10(Pspeech / Pnoise)
+    SNR(dB) =
+        20 log10(
+            RMS_speech / RMS_noise
+        )
 
     Therefore:
 
-        noise_power = speech_power / 10^(SNR/10)
+        noise_RMS =
+        speech_RMS / 10^(SNR/20)
     """
 
-    speech_rms = rms(speech)
-    noise_rms = rms(noise)
+    speech_rms = rms(
+        speech
+    )
+
+    noise_rms = rms(
+        noise
+    )
 
     if noise_rms < 1e-10:
         return speech
 
-    # Desired noise RMS
-    desired_noise_rms = speech_rms / (10 ** (snr_db / 20.0))
-
-    # Scale noise
-    noise_scaled = noise * (
-        desired_noise_rms / noise_rms
+    desired_noise_rms = (
+        speech_rms
+        /
+        (10 ** (snr_db / 20.0))
     )
 
-    # Mix
-    mixed = speech + noise_scaled
+    noise_scaled = (
+        noise
+        *
+        (
+            desired_noise_rms
+            /
+            noise_rms
+        )
+    )
 
-    return mixed.astype(np.float32)
+    mixed = (
+        speech
+        +
+        noise_scaled
+    )
 
+    return mixed.astype(
+        np.float32
+    )
+
+
+# ============================================================
+# CLIPPING PROTECTION
+# ============================================================
 
 def prevent_clipping(audio):
     """
-    Prevent digital clipping.
+    Scale mixture if necessary.
 
-    Scaling the complete mixture does NOT change its SNR.
+    This does NOT change SNR because
+    both speech and noise are scaled together.
     """
 
-    peak = np.max(np.abs(audio))
+    peak = np.max(
+        np.abs(audio)
+    )
 
     if peak > 0.999:
 
-        audio = audio / peak * 0.999
+        audio = (
+            audio / peak
+        ) * 0.999
 
-    return audio.astype(np.float32)
-
-
-# ============================================================
-# DATASET DISCOVERY
-# ============================================================
-
-def find_audio_files(root):
-    """
-    Recursively find WAV/FLAC files.
-    """
-
-    files = []
-
-    root = Path(root)
-
-    for path in root.rglob("*"):
-
-        if path.is_file() and path.suffix.lower() in AUDIO_EXTENSIONS:
-            files.append(path)
-
-    return sorted(files)
-
-
-def find_speech_files(speech_root):
-    """
-    Find all clean speech files.
-
-    Expected:
-
-        raw/signals/speech/
-            speaker001/
-            speaker002/
-            ...
-    """
-
-    files = find_audio_files(speech_root)
-
-    return files
-
-
-def find_noise_files(dataset_root, speech_root):
-    """
-    Find noise files while excluding the speech directory.
-
-    This allows:
-
-        dataset/
-            engine/
-            gunshot/
-            helicopter/
-            rain/
-            siren/
-            ...
-
-    """
-
-    dataset_root = Path(dataset_root).resolve()
-    speech_root = Path(speech_root).resolve()
-
-    noise_files = []
-
-    for path in dataset_root.rglob("*"):
-
-        if not path.is_file():
-            continue
-
-        if path.suffix.lower() not in AUDIO_EXTENSIONS:
-            continue
-
-        # Never treat clean speech as noise
-        try:
-            path.relative_to(speech_root)
-            continue
-        except ValueError:
-            pass
-
-        noise_files.append(path)
-
-    return sorted(noise_files)
+    return audio.astype(
+        np.float32
+    )
 
 
 # ============================================================
-# MAIN GENERATION FUNCTION
+# GENERATE DATA
 # ============================================================
 
 def generate_samples(
     worker_name,
     start_id,
     end_id,
-    speech_files,
-    noise_files,
-    output_root,
-    seed=2026
+    speakers,
+    noise_dataset,
+    output_root
 ):
 
-    output_root = Path(output_root)
+    # --------------------------------------------------------
+    # Worker output folder
+    # --------------------------------------------------------
 
-    worker_output = output_root / worker_name
-    audio_output = worker_output / "audio"
+    worker_dir = (
+        Path(output_root)
+        / worker_name
+    )
 
-    audio_output.mkdir(
+    audio_dir = (
+        worker_dir
+        / "audio"
+    )
+
+    audio_dir.mkdir(
         parents=True,
         exist_ok=True
     )
 
-    metadata_file = worker_output / "metadata.csv"
+    metadata_path = (
+        worker_dir
+        / "metadata.csv"
+    )
 
+    # --------------------------------------------------------
+    # Noise categories
+    # --------------------------------------------------------
+
+    noise_categories = list(
+        noise_dataset.keys()
+    )
+
+    if len(noise_categories) == 0:
+
+        raise RuntimeError(
+            "No noise categories found."
+        )
+
+    if (
+        len(noise_categories)
+        < MIN_NOISES
+    ):
+
+        raise RuntimeError(
+            f"Need at least "
+            f"{MIN_NOISES} noise categories "
+            f"for multiple-noise mixing."
+        )
+
+    # --------------------------------------------------------
     # Metadata
-    metadata_rows = []
+    # --------------------------------------------------------
+
+    metadata = []
+
+    total = end_id - start_id
 
     print()
-    print("=" * 60)
-    print(f"WORKER: {worker_name}")
-    print(f"SAMPLE RANGE: {start_id} -> {end_id - 1}")
-    print(f"NUMBER OF SAMPLES: {end_id - start_id}")
-    print("=" * 60)
+    print("=" * 70)
+    print(f"WORKER       : {worker_name}")
+    print(f"START ID     : {start_id}")
+    print(f"END ID       : {end_id - 1}")
+    print(f"SAMPLES      : {total}")
+    print("=" * 70)
+    print()
 
-    for global_id in range(start_id, end_id):
+    # --------------------------------------------------------
+    # Generate each sample
+    # --------------------------------------------------------
 
-        # ----------------------------------------------------
+    for global_id in range(
+        start_id,
+        end_id
+    ):
+
+        # --------------------------------------------
         # Deterministic RNG
-        # ----------------------------------------------------
-        #
-        # Every sample gets its own seed.
-        #
-        # This means sample 12345 will always be generated
-        # using the same random choices.
-        #
-        sample_rng = random.Random(
-            seed + global_id
+        # --------------------------------------------
+
+        seed = (
+            GLOBAL_SEED
+            + global_id
         )
 
-        np_rng = np.random.default_rng(
-            seed + global_id
+        rng = random.Random(
+            seed
         )
 
-        # ----------------------------------------------------
-        # Select SNR
-        # ----------------------------------------------------
+        # --------------------------------------------
+        # SNR
+        # --------------------------------------------
+
+        # Equal distribution:
         #
-        # Gives an approximately/evenly distributed set.
-        #
+        # 15 dB
+        # 5 dB
+        # 0 dB
+        # -5 dB
+        # -15 dB
+
         snr_db = SNR_LEVELS[
             global_id % len(SNR_LEVELS)
         ]
 
-        # ----------------------------------------------------
+        # --------------------------------------------
         # Select speaker
-        # ----------------------------------------------------
+        # --------------------------------------------
 
-        speech_file = sample_rng.choice(
-            speech_files
+        (
+            speaker_name,
+            speech_file
+        ) = select_speech(
+            speakers,
+            global_id
         )
 
-        speech = choose_speech_segment(
-            speech_file,
-            sample_rng
+        speech = load_audio(
+            speech_file
         )
 
-        if speech is None:
+        if len(speech) == 0:
+
             print(
                 f"Skipping {global_id}: "
-                f"speech too short"
+                f"empty speech file"
             )
+
             continue
 
-        # ----------------------------------------------------
-        # Decide single vs multiple noise
-        # ----------------------------------------------------
+        # --------------------------------------------
+        # Select single/multiple noise
+        # --------------------------------------------
 
         use_multiple_noise = (
-            sample_rng.random()
+            rng.random()
             < MULTI_NOISE_PROBABILITY
         )
 
         if use_multiple_noise:
 
-            number_of_noises = sample_rng.randint(
+            number_of_noises = rng.randint(
                 MIN_NOISES,
-                MAX_NOISES
+                min(
+                    MAX_NOISES,
+                    len(noise_categories)
+                )
             )
 
-            # Cannot select more unique noises than available
-            number_of_noises = min(
-                number_of_noises,
-                len(noise_files)
+            selected_categories = (
+                rng.sample(
+                    noise_categories,
+                    number_of_noises
+                )
             )
 
-            selected_noise_files = sample_rng.sample(
-                noise_files,
-                number_of_noises
-            )
+            noise_files = []
+
+            for category in selected_categories:
+
+                file = rng.choice(
+                    noise_dataset[
+                        category
+                    ]
+                )
+
+                noise_files.append(
+                    file
+                )
 
             noise_type = "multiple"
 
         else:
 
-            selected_noise_files = [
-                sample_rng.choice(noise_files)
+            selected_categories = [
+                rng.choice(
+                    noise_categories
+                )
+            ]
+
+            category = (
+                selected_categories[0]
+            )
+
+            noise_files = [
+                rng.choice(
+                    noise_dataset[
+                        category
+                    ]
+                )
             ]
 
             noise_type = "single"
 
-        # ----------------------------------------------------
+        # --------------------------------------------
         # Create noise
-        # ----------------------------------------------------
+        # --------------------------------------------
 
         noise = create_noise(
-            selected_noise_files,
+            noise_files,
             len(speech),
-            sample_rng
+            rng
         )
 
         if noise is None:
+
             print(
                 f"Skipping {global_id}: "
                 f"invalid noise"
             )
+
             continue
 
-        # ----------------------------------------------------
+        # --------------------------------------------
         # Mix
-        # ----------------------------------------------------
+        # --------------------------------------------
 
         mixed = mix_at_snr(
             speech,
@@ -469,27 +729,33 @@ def generate_samples(
             snr_db
         )
 
-        # ----------------------------------------------------
+        # --------------------------------------------
         # Prevent clipping
-        # ----------------------------------------------------
+        # --------------------------------------------
 
-        mixed = prevent_clipping(mixed)
+        mixed = prevent_clipping(
+            mixed
+        )
 
-        # ----------------------------------------------------
-        # Output filename
-        # ----------------------------------------------------
+        # --------------------------------------------
+        # Filename
+        # --------------------------------------------
 
         filename = (
             f"sample_{global_id:06d}"
+            f"_speaker_{speaker_name}"
             f"_snr_{snr_db:+03d}dB"
             f"_{noise_type}.wav"
         )
 
-        output_file = audio_output / filename
+        output_file = (
+            audio_dir
+            / filename
+        )
 
-        # ----------------------------------------------------
-        # Save
-        # ----------------------------------------------------
+        # --------------------------------------------
+        # Save noisy audio
+        # --------------------------------------------
 
         sf.write(
             output_file,
@@ -498,55 +764,76 @@ def generate_samples(
             subtype="PCM_16"
         )
 
-        # ----------------------------------------------------
+        # --------------------------------------------
         # Metadata
-        # ----------------------------------------------------
+        # --------------------------------------------
 
-        noise_names = [
-            str(path.relative_to(Path(dataset_root)))
-            if False
-            else str(path)
-            for path in selected_noise_files
-        ]
+        metadata.append([
 
-        speaker_id = speech_file.parent.name
-
-        metadata_rows.append([
             global_id,
+
             filename,
-            speaker_id,
+
+            speaker_name,
+
+            speech_file.name,
+
             str(speech_file),
-            "|".join(noise_names),
+
             noise_type,
+
+            "|".join(
+                selected_categories
+            ),
+
+            "|".join(
+                str(f)
+                for f in noise_files
+            ),
+
             snr_db,
+
             TARGET_SR,
+
             len(mixed) / TARGET_SR
         ])
 
-        # ----------------------------------------------------
+        # --------------------------------------------
         # Progress
-        # ----------------------------------------------------
+        # --------------------------------------------
+
+        completed = (
+            global_id
+            - start_id
+            + 1
+        )
 
         if (
-            (global_id - start_id + 1) % 100 == 0
-            or global_id == end_id - 1
+            completed % 100 == 0
+            or
+            completed == total
         ):
 
-            completed = global_id - start_id + 1
-            total = end_id - start_id
+            percentage = (
+                completed
+                /
+                total
+                *
+                100
+            )
 
             print(
                 f"[{worker_name}] "
                 f"{completed}/{total} "
-                f"generated"
+                f"({percentage:.1f}%)"
             )
 
     # ========================================================
-    # Write metadata
+    # SAVE METADATA
     # ========================================================
 
     with open(
-        metadata_file,
+        metadata_path,
         "w",
         newline="",
         encoding="utf-8"
@@ -555,30 +842,43 @@ def generate_samples(
         writer = csv.writer(f)
 
         writer.writerow([
+
             "global_id",
+
             "filename",
+
             "speaker_id",
-            "speech_file",
-            "noise_files",
+
+            "speech_filename",
+
+            "speech_path",
+
             "noise_type",
+
+            "noise_categories",
+
+            "noise_files",
+
             "snr_db",
+
             "sample_rate",
+
             "duration_seconds"
+
         ])
 
-        writer.writerows(metadata_rows)
+        writer.writerows(
+            metadata
+        )
 
     print()
-    print(
-        f"Finished {worker_name}: "
-        f"{len(metadata_rows)} samples"
-    )
-    print(
-        f"Audio: {audio_output}"
-    )
-    print(
-        f"Metadata: {metadata_file}"
-    )
+    print("=" * 70)
+    print(f"{worker_name} FINISHED")
+    print(f"Generated : {len(metadata)}")
+    print(f"Audio     : {audio_dir}")
+    print(f"Metadata  : {metadata_path}")
+    print("=" * 70)
+    print()
 
 
 # ============================================================
@@ -588,7 +888,10 @@ def generate_samples(
 if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(
-        description="Generate noisy speech dataset"
+        description=(
+            "Generate 50,000 noisy speech "
+            "samples from 41 speakers."
+        )
     )
 
     parser.add_argument(
@@ -598,17 +901,18 @@ if __name__ == "__main__":
             "harini",
             "personA",
             "personC"
-        ],
-        help="Which person's 1/3 of dataset to generate"
+        ]
     )
 
     args = parser.parse_args()
 
-    # --------------------------------------------------------
-    # Paths
-    # --------------------------------------------------------
+    # ========================================================
+    # PATHS
+    # ========================================================
 
-    PROJECT_ROOT = Path(__file__).resolve().parent
+    PROJECT_ROOT = (
+        Path(__file__).resolve().parent
+    )
 
     DATASET_ROOT = (
         PROJECT_ROOT / "dataset"
@@ -626,97 +930,109 @@ if __name__ == "__main__":
         / "generated"
     )
 
-    # --------------------------------------------------------
-    # Discover files
-    # --------------------------------------------------------
+    # ========================================================
+    # FIND SPEAKERS
+    # ========================================================
 
-    print("Searching for speech files...")
+    print()
+    print("Checking clean speech dataset...")
+    print()
 
-    speech_files = find_speech_files(
+    speakers = find_speech_dataset(
         SPEECH_ROOT
     )
 
     print(
-        f"Found {len(speech_files)} "
-        f"clean speech files."
+        f"Found {len(speakers)} speakers."
     )
 
-    print("Searching for noise files...")
+    total_recordings = sum(
+        len(files)
+        for files in speakers.values()
+    )
 
-    noise_files = find_noise_files(
+    print(
+        f"Found {total_recordings} "
+        f"clean recordings."
+    )
+
+    print()
+
+    # ========================================================
+    # FIND NOISES
+    # ========================================================
+
+    print(
+        "Searching for noise files..."
+    )
+
+    noise_dataset = find_noise_dataset(
         DATASET_ROOT,
         SPEECH_ROOT
     )
 
+    print()
+
     print(
-        f"Found {len(noise_files)} "
-        f"noise files."
+        f"Found {len(noise_dataset)} "
+        f"noise categories:"
     )
 
-    # --------------------------------------------------------
-    # Validate
-    # --------------------------------------------------------
+    for category, files in noise_dataset.items():
 
-    if len(speech_files) == 0:
-
-        raise RuntimeError(
-            f"No speech files found in:\n"
-            f"{SPEECH_ROOT}"
+        print(
+            f"  {category}: "
+            f"{len(files)} files"
         )
 
-    if len(noise_files) == 0:
+    print()
 
-        raise RuntimeError(
-            f"No noise files found in:\n"
-            f"{DATASET_ROOT}"
-        )
-
-    if len(noise_files) < MIN_NOISES:
-
-        raise RuntimeError(
-            f"Need at least "
-            f"{MIN_NOISES} noise files "
-            f"for multiple-noise mixing."
-        )
-
-    # --------------------------------------------------------
-    # Dataset split
-    # --------------------------------------------------------
-
-    TOTAL_SAMPLES = 50000
+    # ========================================================
+    # WORKER SPLITS
+    # ========================================================
 
     worker_ranges = {
 
+        # 16,667
         "harini": (
             0,
             16667
         ),
 
+        # 16,667
         "personA": (
             16667,
             33334
         ),
 
+        # 16,666
         "personC": (
             33334,
             50000
         )
     }
 
-    start_id, end_id = worker_ranges[
-        args.worker
-    ]
+    start_id, end_id = (
+        worker_ranges[
+            args.worker
+        ]
+    )
 
-    # --------------------------------------------------------
-    # Generate
-    # --------------------------------------------------------
+    # ========================================================
+    # GENERATE
+    # ========================================================
 
     generate_samples(
+
         worker_name=args.worker,
+
         start_id=start_id,
+
         end_id=end_id,
-        speech_files=speech_files,
-        noise_files=noise_files,
-        output_root=OUTPUT_ROOT,
-        seed=2026
+
+        speakers=speakers,
+
+        noise_dataset=noise_dataset,
+
+        output_root=OUTPUT_ROOT
     )
